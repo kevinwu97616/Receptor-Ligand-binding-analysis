@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useImperativeHandle, forwardRef } from 'react';
+import React, { useEffect, useRef, useImperativeHandle, forwardRef, useState } from 'react';
 import * as $3Dmol from '3dmol';
 import { getMatchingAtoms, kabsch, applyTransform } from '../lib/kabsch';
 import { MOD_COLORS, ORIG_COLOR } from '../constants';
@@ -7,6 +7,7 @@ export interface FileData {
   name: string;
   content: string;
   type: string;
+  energy?: string;
 }
 
 export interface LigandInfo {
@@ -27,8 +28,9 @@ export interface Interaction {
 
 export interface AnalysisResult {
   ligandName: string;
-  interactingResidues: { resn: string; resi: number; chain: string; types: Set<string> }[];
+  interactingResidues: { resn: string; resi: number; chain: string; types: Set<string>; ligands: Set<string> }[];
   centroid?: { x: number; y: number; z: number };
+  ligandAtoms?: { name: string; elem: string; x: number; y: number; z: number }[];
 }
 
 export interface Viewer3DHandle {
@@ -70,6 +72,7 @@ export const Viewer3D = forwardRef<Viewer3DHandle, Viewer3DProps>(({
   const viewerInstance = useRef<any>(null);
   const lastFiles = useRef({ original: '', modified: '' });
   const shouldZoom = useRef(false);
+  const [hoveredResidue, setHoveredResidue] = useState<string | null>(null);
   
   // Use refs for callbacks to avoid re-triggering useEffect unnecessarily
   const callbacks = useRef({ onLigandsDetected, onAnalysisComplete });
@@ -359,7 +362,7 @@ export const Viewer3D = forwardRef<Viewer3DHandle, Viewer3DProps>(({
 
       const receptorAtoms = model.selectedAtoms(pocketSel);
       const interactions: Interaction[] = [];
-      const interactingResiduesMap = new Map<string, { resn: string; resi: number; chain: string; types: Set<string> }>();
+      const interactingResiduesMap = new Map<string, { resn: string; resi: number; chain: string; types: Set<string>; ligands: Set<string> }>();
 
       // Interaction Detection
       ligandAtoms.forEach((lAtom: any) => {
@@ -383,9 +386,12 @@ export const Viewer3D = forwardRef<Viewer3DHandle, Viewer3DProps>(({
               interactions.push({ type, ligandAtom: lAtom, receptorAtom: rAtom, distance: dist });
               const resKey = `${rAtom.chain}-${rAtom.resn}-${rAtom.resi}`;
               if (!interactingResiduesMap.has(resKey)) {
-                interactingResiduesMap.set(resKey, { resn: rAtom.resn, resi: rAtom.resi, chain: rAtom.chain, types: new Set() });
+                interactingResiduesMap.set(resKey, { resn: rAtom.resn, resi: rAtom.resi, chain: rAtom.chain, types: new Set(), ligands: new Set() });
               }
               interactingResiduesMap.get(resKey)!.types.add(type);
+              
+              const ligChain = lAtom.chain ? `${lAtom.chain}:` : '';
+              interactingResiduesMap.get(resKey)!.ligands.add(`${ligChain}${lAtom.resn}${lAtom.resi}`);
             }
           }
         });
@@ -415,7 +421,8 @@ export const Viewer3D = forwardRef<Viewer3DHandle, Viewer3DProps>(({
       callbacks.current.onAnalysisComplete(fileName, {
         ligandName: targetLigands.map(l => l.label).join(', '),
         interactingResidues: Array.from(interactingResiduesMap.values()).sort((a, b) => a.resi - b.resi),
-        centroid
+        centroid,
+        ligandAtoms: ligandAtoms.map((a: any) => ({ name: a.atom, elem: a.elem, x: a.x, y: a.y, z: a.z }))
       });
     };
 
@@ -447,6 +454,24 @@ export const Viewer3D = forwardRef<Viewer3DHandle, Viewer3DProps>(({
       shouldZoom.current = false;
     }
     
+    viewer.setHoverable({}, true, 
+      (atom: any) => {
+        if (atom) {
+          const resn = atom.resn || '';
+          const resi = atom.resi || '';
+          const chain = atom.chain || '';
+          const elem = atom.elem || '';
+          const name = atom.atom || '';
+          setHoveredResidue(`${resn} ${resi} (Chain ${chain}) - ${name} (${elem})`);
+          viewer.render(); // Ensure it updates if needed
+        }
+      },
+      () => {
+        setHoveredResidue(null);
+        viewer.render();
+      }
+    );
+
     viewer.render();
 
   }, [originalFile, modifiedFiles, selectedLigandsMap, visibleFiles, showSurface, showInteractions, isAligned, origAlignChain, modAlignChain]);
@@ -516,6 +541,12 @@ export const Viewer3D = forwardRef<Viewer3DHandle, Viewer3DProps>(({
           </div>
         )}
       </div>
+
+      {hoveredResidue && (
+        <div className="absolute bottom-16 right-4 bg-white/95 backdrop-blur-sm px-3 py-2 rounded-lg shadow-lg border border-gray-200 text-xs font-mono text-gray-800 z-10 pointer-events-none">
+          {hoveredResidue}
+        </div>
+      )}
     </div>
   );
 });

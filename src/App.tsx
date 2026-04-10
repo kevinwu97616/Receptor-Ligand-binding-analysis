@@ -3,6 +3,13 @@ import { Viewer3D, FileData, AnalysisResult, LigandInfo, Viewer3DHandle } from '
 import { Upload, Eye, EyeOff, Activity, Settings2, FileText, Zap, Layers, ChevronDown, ChevronUp, Trash2, CheckCircle2, Camera, RotateCcw, BookmarkPlus, Bookmark } from 'lucide-react';
 import { MOD_COLORS, ORIG_COLOR } from './constants';
 
+export interface RankDetails {
+  rmsd: number | null;
+  energy: number;
+  interactionScore: number;
+  totalScore: number;
+}
+
 export default function App() {
   const [files, setFiles] = useState<FileData[]>([]);
   const [originalFile, setOriginalFile] = useState<FileData | null>(null);
@@ -12,6 +19,7 @@ export default function App() {
   const [detectedLigandsMap, setDetectedLigandsMap] = useState<Record<string, LigandInfo[]>>({});
   const [selectedLigandsMap, setSelectedLigandsMap] = useState<Record<string, LigandInfo[]>>({});
   const [analysisMap, setAnalysisMap] = useState<Record<string, AnalysisResult | null>>({});
+  const [rankDetailsMap, setRankDetailsMap] = useState<Record<string, RankDetails>>({});
 
   const [visibleFiles, setVisibleFiles] = useState<Set<string>>(new Set());
   const [showSurface, setShowSurface] = useState<boolean>(false);
@@ -151,10 +159,22 @@ export default function App() {
       return new Promise<FileData>((resolve) => {
         const reader = new FileReader();
         reader.onload = (event) => {
+          const content = event.target?.result as string;
+          let energy: string | undefined;
+          const energyMatch = content.match(/REMARK\s+Model\s+\d+\s+energy=\s*(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)/i);
+          if (energyMatch && energyMatch[1]) {
+            const parsedVal = parseFloat(energyMatch[1]);
+            if (!isNaN(parsedVal)) {
+              energy = parsedVal > 0 ? `-${parsedVal}` : parsedVal.toString();
+            } else {
+              energy = energyMatch[1];
+            }
+          }
           resolve({
             name: file.name,
-            content: event.target?.result as string,
+            content,
             type: file.type || 'text/plain',
+            energy,
           });
         };
         reader.readAsText(file);
@@ -237,35 +257,81 @@ export default function App() {
     }
 
     const origResSet = new Set(origAnalysis.interactingResidues.map(r => `${r.chain}${r.resn}${r.resi}`));
+    const newRankDetails: Record<string, RankDetails> = {};
     
     const scoredFiles = modifiedFiles.map(file => {
       const modAnalysis = analysisMap[file.name];
       if (!modAnalysis || !modAnalysis.centroid) return { file, score: -1000 };
       
+      // 1. RMSD Calculation (fallback to centroid distance if atoms don't match)
+      let rmsd: number | null = null;
+      if (origAnalysis.ligandAtoms && modAnalysis.ligandAtoms) {
+        const map2 = new Map(modAnalysis.ligandAtoms.map(a => [a.name, a]));
+        let sumSq = 0;
+        let count = 0;
+        for (const a1 of origAnalysis.ligandAtoms) {
+          const a2 = map2.get(a1.name);
+          if (a2) {
+            const dx = a1.x - a2.x;
+            const dy = a1.y - a2.y;
+            const dz = a1.z - a2.z;
+            sumSq += dx*dx + dy*dy + dz*dz;
+            count++;
+          }
+        }
+        if (count > 0) {
+          rmsd = Math.sqrt(sumSq / count);
+        }
+      }
+      
       const dx = modAnalysis.centroid.x - origAnalysis.centroid.x;
       const dy = modAnalysis.centroid.y - origAnalysis.centroid.y;
       const dz = modAnalysis.centroid.z - origAnalysis.centroid.z;
-      const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+      const centroidDist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+      
+      const effectiveRmsd = rmsd !== null ? rmsd : centroidDist;
 
-      const conserved = modAnalysis.interactingResidues.filter(r => origResSet.has(`${r.chain}${r.resn}${r.resi}`)).length;
+      // 2. Interaction Score Calculation
+      let interactionScore = 0;
+      modAnalysis.interactingResidues.forEach(r => {
+        if (r.types.has('polar')) interactionScore += 2;
+        if (r.types.has('hydrophobic')) interactionScore += 1;
+      });
+
+      // 3. Energy Calculation
+      const energyVal = file.energy ? parseFloat(file.energy) : 0;
+      const energyNum = isNaN(energyVal) ? 0 : energyVal;
+
+      // Composite Score Formula
+      // - RMSD: lower is better. Max 50 points for 0A, 0 points for >10A.
+      const rmsdScore = Math.max(0, 10 - effectiveRmsd) * 5; 
       
-      // Score: higher is better. 
-      // Primary factor: Spatial similarity (Centroid Distance)
-      // Secondary factor: Binding site conservation
+      // - Energy: lower is better (more negative). We'll use -energy as the score component.
+      // E.g., energy -200 -> +200 points. If energy is positive, it penalizes.
+      // To balance weights, let's normalize or just add it directly if they are in similar ranges.
+      // We'll multiply by a weight factor, say 0.5.
+      const energyScore = -energyNum * 0.5;
+
+      // - Interaction: higher is better. 
+      // E.g., 10 polar + 5 hydrophobic = 25 points. Multiply by 2.
+      const intScoreWeighted = interactionScore * 2;
+
+      // Penalty for completely different pocket
+      const penalty = centroidDist > 15 ? -500 : 0;
       
-      // We want low distance. 
-      // A distance > 5A is likely a different pocket.
-      const distanceScore = Math.max(0, 20 - dist) * 5; // 100 points max for 0A, 0 points for 20A+
-      const conservationScore = (conserved / Math.max(1, origAnalysis.interactingResidues.length)) * 50; // 50 points max
+      const totalScore = rmsdScore + energyScore + intScoreWeighted + penalty;
       
-      // If distance is very large (> 10A), it's probably not the same site.
-      const penalty = dist > 10 ? -500 : 0;
+      newRankDetails[file.name] = {
+        rmsd: effectiveRmsd,
+        energy: energyNum,
+        interactionScore,
+        totalScore
+      };
       
-      const score = distanceScore + conservationScore + penalty;
-      
-      return { file, score };
+      return { file, score: totalScore };
     });
 
+    setRankDetailsMap(newRankDetails);
     const sorted = [...scoredFiles].sort((a, b) => b.score - a.score).map(s => s.file);
     setModifiedFiles(sorted);
     setFiles(prev => {
@@ -306,42 +372,42 @@ export default function App() {
         <title>ProLigand Analysis Report</title>
         <style>
           @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500&display=swap');
-          body { font-family: 'Inter', -apple-system, sans-serif; line-height: 1.5; color: #374151; max-width: 1000px; margin: 0 auto; padding: 40px; background: #f9fafb; }
-          .card { background: white; border-radius: 16px; box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1), 0 1px 2px 0 rgba(0, 0, 0, 0.06); padding: 32px; margin-bottom: 32px; border: 1px solid #f3f4f6; page-break-inside: avoid; }
-          h1 { color: #111827; font-size: 2.25rem; font-weight: 800; letter-spacing: -0.025em; margin-bottom: 8px; }
-          h2 { color: #111827; font-size: 1.5rem; font-weight: 700; margin-top: 0; display: flex; align-items: center; gap: 12px; margin-bottom: 24px; }
-          h2::before { content: ""; width: 4px; height: 24px; background: #6366f1; border-radius: 2px; }
-          .section-title { font-weight: 700; text-transform: uppercase; font-size: 0.75rem; color: #9ca3af; letter-spacing: 0.1em; margin-bottom: 12px; margin-top: 24px; display: flex; align-items: center; }
+          body { font-family: 'Inter', -apple-system, sans-serif; line-height: 1.4; color: #374151; max-width: 1000px; margin: 0 auto; padding: 20px; background: #f9fafb; }
+          .card { background: white; border-radius: 12px; box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1), 0 1px 2px 0 rgba(0, 0, 0, 0.06); padding: 20px; margin-bottom: 20px; border: 1px solid #f3f4f6; page-break-inside: avoid; }
+          h1 { color: #111827; font-size: 1.75rem; font-weight: 800; letter-spacing: -0.025em; margin-bottom: 4px; }
+          h2 { color: #111827; font-size: 1.25rem; font-weight: 700; margin-top: 0; display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+          h2::before { content: ""; width: 4px; height: 20px; background: #6366f1; border-radius: 2px; }
+          .section-title { font-weight: 700; text-transform: uppercase; font-size: 0.75rem; color: #9ca3af; letter-spacing: 0.1em; margin-bottom: 8px; margin-top: 16px; display: flex; align-items: center; }
           .section-title::after { content: ""; flex: 1; height: 1px; background: #f3f4f6; margin-left: 12px; }
-          .snapshot-container { background: #000; border-radius: 12px; overflow: hidden; margin: 16px 0; border: 1px solid #e5e7eb; box-shadow: inset 0 2px 4px 0 rgba(0,0,0,0.06); }
-          .snapshot { width: 100%; display: block; max-height: 450px; object-fit: contain; }
-          .residue-tag { display: inline-flex; align-items: center; padding: 4px 10px; background: #f3f4f6; border-radius: 6px; margin: 3px; font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; border: 1px solid #e5e7eb; font-weight: 600; color: #4b5563; }
+          .snapshot-container { background: #000; border-radius: 8px; overflow: hidden; margin: 12px 0; border: 1px solid #e5e7eb; box-shadow: inset 0 2px 4px 0 rgba(0,0,0,0.06); }
+          .snapshot { width: 100%; display: block; max-height: 300px; object-fit: contain; }
+          .residue-tag { display: inline-flex; align-items: center; padding: 2px 6px; background: #f3f4f6; border-radius: 4px; margin: 2px; font-family: 'JetBrains Mono', monospace; font-size: 0.7rem; border: 1px solid #e5e7eb; font-weight: 600; color: #4b5563; }
           .polar { border-left: 3px solid #3b82f6; background: #eff6ff; color: #1e40af; }
           .hydrophobic { border-left: 3px solid #f97316; background: #fff7ed; color: #9a3412; }
-          .meta { font-size: 0.875rem; color: #6b7280; margin-bottom: 40px; display: flex; gap: 20px; }
-          .badge { padding: 4px 12px; border-radius: 9999px; font-size: 0.75rem; font-weight: 700; text-transform: uppercase; }
+          .meta { font-size: 0.875rem; color: #6b7280; margin-bottom: 20px; display: flex; gap: 20px; }
+          .badge { padding: 2px 8px; border-radius: 9999px; font-size: 0.7rem; font-weight: 700; text-transform: uppercase; }
           .badge-conserved { background: #dcfce7; color: #166534; }
           .badge-gained { background: #fce7f3; color: #9d174d; }
           .badge-lost { background: #f3f4f6; color: #4b5563; text-decoration: line-through; opacity: 0.7; }
-          table { width: 100%; border-collapse: separate; border-spacing: 0; margin-top: 12px; border: 1px solid #f3f4f6; border-radius: 12px; overflow: hidden; }
-          th, td { text-align: left; padding: 14px 16px; border-bottom: 1px solid #f3f4f6; }
-          th { background: #f9fafb; font-size: 0.75rem; text-transform: uppercase; color: #6b7280; font-weight: 700; letter-spacing: 0.05em; }
+          table { width: 100%; border-collapse: separate; border-spacing: 0; margin-top: 8px; border: 1px solid #f3f4f6; border-radius: 8px; overflow: hidden; }
+          th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #f3f4f6; font-size: 0.875rem; }
+          th { background: #f9fafb; font-size: 0.7rem; text-transform: uppercase; color: #6b7280; font-weight: 700; letter-spacing: 0.05em; }
           tr:last-child td { border-bottom: none; }
-          .conclusion { background: #f8fafc; border: 1px solid #e2e8f0; padding: 24px; border-radius: 12px; margin-top: 24px; position: relative; overflow: hidden; }
+          .conclusion { background: #f8fafc; border: 1px solid #e2e8f0; padding: 16px; border-radius: 8px; margin-top: 16px; position: relative; overflow: hidden; }
           .conclusion::before { content: ""; position: absolute; top: 0; left: 0; width: 4px; height: 100%; background: #94a3b8; }
-          .conclusion-title { font-weight: 800; color: #475569; font-size: 0.75rem; text-transform: uppercase; margin-bottom: 8px; letter-spacing: 0.05em; }
-          .conclusion-text { font-size: 0.9375rem; color: #334155; line-height: 1.6; }
-          .summary-box { background: #111827; color: white; padding: 32px; border-radius: 20px; margin-bottom: 40px; position: relative; overflow: hidden; }
-          .summary-box::after { content: ""; position: absolute; top: -50%; right: -10%; width: 300px; height: 300px; background: radial-gradient(circle, rgba(99, 102, 241, 0.15) 0%, transparent 70%); }
-          .summary-title { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; opacity: 0.5; margin-bottom: 16px; letter-spacing: 0.1em; }
-          .summary-stats { display: flex; gap: 48px; }
-          .stat-item { display: flex; flex-direction: column; gap: 4px; }
-          .stat-value { font-size: 2rem; font-weight: 800; color: #818cf8; }
-          .stat-label { font-size: 0.875rem; opacity: 0.6; font-weight: 500; }
-          .comparison-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-top: 24px; }
-          .comp-card { background: #f9fafb; padding: 16px; border-radius: 12px; border: 1px solid #f3f4f6; }
-          .comp-val { font-size: 1.5rem; font-weight: 800; margin-bottom: 4px; }
-          .comp-label { font-size: 0.75rem; font-weight: 600; text-transform: uppercase; color: #9ca3af; }
+          .conclusion-title { font-weight: 800; color: #475569; font-size: 0.7rem; text-transform: uppercase; margin-bottom: 4px; letter-spacing: 0.05em; }
+          .conclusion-text { font-size: 0.875rem; color: #334155; line-height: 1.5; }
+          .summary-box { background: #111827; color: white; padding: 20px; border-radius: 12px; margin-bottom: 24px; position: relative; overflow: hidden; }
+          .summary-box::after { content: ""; position: absolute; top: -50%; right: -10%; width: 200px; height: 200px; background: radial-gradient(circle, rgba(99, 102, 241, 0.15) 0%, transparent 70%); }
+          .summary-title { font-size: 0.7rem; font-weight: 700; text-transform: uppercase; opacity: 0.5; margin-bottom: 12px; letter-spacing: 0.1em; }
+          .summary-stats { display: flex; gap: 24px; }
+          .stat-item { display: flex; flex-direction: column; gap: 2px; }
+          .stat-value { font-size: 1.5rem; font-weight: 800; color: #818cf8; }
+          .stat-label { font-size: 0.8rem; opacity: 0.6; font-weight: 500; }
+          .comparison-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-top: 16px; }
+          .comp-card { background: #f9fafb; padding: 12px; border-radius: 8px; border: 1px solid #f3f4f6; }
+          .comp-val { font-size: 1.25rem; font-weight: 800; margin-bottom: 2px; }
+          .comp-label { font-size: 0.7rem; font-weight: 600; text-transform: uppercase; color: #9ca3af; }
         </style>
       </head>
       <body>
@@ -387,11 +453,12 @@ export default function App() {
           </div>
           <div class="section-title">Ligand Information</div>
           <p style="font-size: 0.9375rem;"><strong>Detected Ligand:</strong> <span style="color: #6366f1; font-weight: 700;">${origAnalysis?.ligandName || "N/A"}</span></p>
+          ${originalFile.energy !== undefined ? `<p style="font-size: 0.9375rem;"><strong>Energy:</strong> <span style="color: #d97706; font-weight: 700;">${originalFile.energy}</span></p>` : ''}
           <div class="section-title">Interaction Profile (${origAnalysis?.interactingResidues.length || 0} residues)</div>
           <div style="margin-top: 12px;">
             ${origAnalysis?.interactingResidues.map(r => `
               <span class="residue-tag ${Array.from(r.types).join(' ')}">
-                ${r.chain}:${r.resn}${r.resi}
+                L(${Array.from(r.ligands || []).join(', ')}) ↔ R(${r.chain}:${r.resn}${r.resi})
               </span>
             `).join('') || "No interactions detected."}
           </div>
@@ -440,13 +507,34 @@ export default function App() {
             const totalOrig = origAnalysis.interactingResidues.length;
             const conservationRate = ((conservedCount / totalOrig) * 100).toFixed(1);
 
+            const rankDetails = rankDetailsMap[modFile.name];
+            
             comparisonSection = `
-              <div class="section-title">Comparative Analysis (vs. Reference)</div>
+              <div class="section-title">Comparative Analysis & Ranking (vs. Reference)</div>
               <div class="comparison-grid">
+                ${rankDetails ? `
+                <div class="comp-card" style="background: #ecfdf5; border-color: #a7f3d0;">
+                  <div class="comp-val" style="color: #059669;">${rankDetails.totalScore.toFixed(1)}</div>
+                  <div class="comp-label">Composite Rank Score</div>
+                </div>
+                <div class="comp-card">
+                  <div class="comp-val" style="color: #4f46e5;">${rankDetails.rmsd !== null ? rankDetails.rmsd.toFixed(2) : centroidDist.toFixed(2)} Å</div>
+                  <div class="comp-label">${rankDetails.rmsd !== null ? 'Ligand RMSD' : 'Centroid Distance'}</div>
+                </div>
+                <div class="comp-card">
+                  <div class="comp-val" style="color: #d97706;">${rankDetails.energy}</div>
+                  <div class="comp-label">Energy</div>
+                </div>
+                <div class="comp-card">
+                  <div class="comp-val" style="color: #db2777;">${rankDetails.interactionScore}</div>
+                  <div class="comp-label">Interaction Score</div>
+                </div>
+                ` : `
                 <div class="comp-card">
                   <div class="comp-val" style="color: #4f46e5;">${centroidDist.toFixed(2)} Å</div>
                   <div class="comp-label">Centroid Distance</div>
                 </div>
+                `}
                 <div class="comp-card">
                   <div class="comp-val" style="color: #059669;">${conservedCount}</div>
                   <div class="comp-label">Conserved</div>
@@ -464,15 +552,15 @@ export default function App() {
                 <tbody>
                   <tr>
                     <td><span class="badge badge-conserved">Conserved</span></td>
-                    <td>${conserved.map(r => `<span class="residue-tag">${r.chain}:${r.resn}${r.resi}</span>`).join(' ')}</td>
+                    <td>${conserved.map(r => `<span class="residue-tag">L(${Array.from(r.ligands || []).join(', ')}) ↔ R(${r.chain}:${r.resn}${r.resi})</span>`).join(' ')}</td>
                   </tr>
                   <tr>
                     <td><span class="badge badge-gained">Gained</span></td>
-                    <td>${gained.map(r => `<span class="residue-tag">${r.chain}:${r.resn}${r.resi}</span>`).join(' ')}</td>
+                    <td>${gained.map(r => `<span class="residue-tag">L(${Array.from(r.ligands || []).join(', ')}) ↔ R(${r.chain}:${r.resn}${r.resi})</span>`).join(' ')}</td>
                   </tr>
                   <tr>
                     <td><span class="badge badge-lost">Lost</span></td>
-                    <td>${lost.map(r => `<span class="residue-tag">${r.chain}:${r.resn}${r.resi}</span>`).join(' ')}</td>
+                    <td>${lost.map(r => `<span class="residue-tag">L(${Array.from(r.ligands || []).join(', ')}) ↔ R(${r.chain}:${r.resn}${r.resi})</span>`).join(' ')}</td>
                   </tr>
                 </tbody>
               </table>
@@ -504,6 +592,7 @@ export default function App() {
             </div>
             <div class="section-title">Ligand Information</div>
             <p style="font-size: 0.9375rem;"><strong>Detected Ligand:</strong> <span style="color: #6366f1; font-weight: 700;">${modAnalysis?.ligandName || "N/A"}</span></p>
+            ${modFile.energy !== undefined ? `<p style="font-size: 0.9375rem;"><strong>Energy:</strong> <span style="color: #d97706; font-weight: 700;">${modFile.energy}</span></p>` : ''}
             ${comparisonSection}
             <div class="conclusion">
               <div class="conclusion-title">Analysis Conclusion</div>
@@ -789,8 +878,20 @@ export default function App() {
                                 </div>
                                 <div className="min-w-0 flex-1">
                                   <span className="text-xs font-bold break-all text-gray-800 block leading-tight" title={file.name}>{file.name}</span>
-                                  {isOriginal && <span className="text-[8px] font-black text-blue-600 uppercase tracking-widest">Reference</span>}
-                                  {isModified && <span className="text-[8px] font-black text-indigo-600 uppercase tracking-widest">Variant</span>}
+                                  <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
+                                    {isOriginal && <span className="text-[8px] font-black text-blue-600 uppercase tracking-widest">Reference</span>}
+                                    {isModified && <span className="text-[8px] font-black text-indigo-600 uppercase tracking-widest">Variant</span>}
+                                    {file.energy !== undefined && (
+                                      <span className="text-[8px] font-bold text-amber-700 bg-amber-100/80 px-1 rounded-sm border border-amber-200/50">
+                                        Energy: {file.energy}
+                                      </span>
+                                    )}
+                                    {rankDetailsMap[file.name] && (
+                                      <span className="text-[8px] font-bold text-emerald-700 bg-emerald-100/80 px-1 rounded-sm border border-emerald-200/50" title={`RMSD: ${rankDetailsMap[file.name].rmsd?.toFixed(2) || 'N/A'}, Energy: ${rankDetailsMap[file.name].energy}, Interactions: ${rankDetailsMap[file.name].interactionScore}`}>
+                                        Score: {rankDetailsMap[file.name].totalScore.toFixed(1)}
+                                      </span>
+                                    )}
+                                  </div>
                                 </div>
                               </div>
                               
@@ -914,8 +1015,8 @@ export default function App() {
                         </h3>
                         <div className="flex flex-wrap gap-1.5">
                           {pocketDiff.gained.map(r => (
-                            <span key={`${r.chain}${r.resn}${r.resi}`} className="px-2 py-1 bg-pink-50 text-pink-700 text-xs rounded border border-pink-100 font-mono" title={Array.from(r.types).join(', ')}>
-                              {r.chain}:{r.resn}{r.resi}
+                            <span key={`${r.chain}${r.resn}${r.resi}`} className="px-2 py-1 bg-pink-50 text-pink-700 text-[10px] rounded border border-pink-100 font-mono" title={Array.from(r.types).join(', ')}>
+                              L({Array.from(r.ligands || []).join(',')}) ↔ R({r.chain}:{r.resn}{r.resi})
                             </span>
                           ))}
                         </div>
@@ -930,8 +1031,8 @@ export default function App() {
                         </h3>
                         <div className="flex flex-wrap gap-1.5">
                           {pocketDiff.lost.map(r => (
-                            <span key={`${r.chain}${r.resn}${r.resi}`} className="px-2 py-1 bg-blue-50 text-blue-700 text-xs rounded border border-blue-100 font-mono line-through opacity-70" title={Array.from(r.types).join(', ')}>
-                              {r.chain}:{r.resn}{r.resi}
+                            <span key={`${r.chain}${r.resn}${r.resi}`} className="px-2 py-1 bg-blue-50 text-blue-700 text-[10px] rounded border border-blue-100 font-mono line-through opacity-70" title={Array.from(r.types).join(', ')}>
+                              L({Array.from(r.ligands || []).join(',')}) ↔ R({r.chain}:{r.resn}{r.resi})
                             </span>
                           ))}
                         </div>
@@ -946,8 +1047,8 @@ export default function App() {
                         </h3>
                         <div className="flex flex-wrap gap-1.5">
                           {pocketDiff.common.map(r => (
-                            <span key={`${r.chain}${r.resn}${r.resi}`} className="px-2 py-1 bg-gray-100 text-gray-700 text-xs rounded border border-gray-200 font-mono" title={Array.from(r.types).join(', ')}>
-                              {r.chain}:{r.resn}{r.resi}
+                            <span key={`${r.chain}${r.resn}${r.resi}`} className="px-2 py-1 bg-gray-100 text-gray-700 text-[10px] rounded border border-gray-200 font-mono" title={Array.from(r.types).join(', ')}>
+                              L({Array.from(r.ligands || []).join(',')}) ↔ R({r.chain}:{r.resn}{r.resi})
                             </span>
                           ))}
                         </div>
@@ -961,8 +1062,8 @@ export default function App() {
                         <h3 className="text-xs font-bold text-blue-600 mb-2">Original Interactions</h3>
                         <div className="flex flex-wrap gap-1.5">
                           {origAnalysis.interactingResidues.map(r => (
-                            <span key={`${r.chain}${r.resn}${r.resi}`} className="px-2 py-1 bg-blue-50 text-blue-700 text-xs rounded border border-blue-100 font-mono" title={Array.from(r.types).join(', ')}>
-                              {r.chain}:{r.resn}{r.resi}
+                            <span key={`${r.chain}${r.resn}${r.resi}`} className="px-2 py-1 bg-blue-50 text-blue-700 text-[10px] rounded border border-blue-100 font-mono" title={Array.from(r.types).join(', ')}>
+                              L({Array.from(r.ligands || []).join(',')}) ↔ R({r.chain}:{r.resn}{r.resi})
                             </span>
                           ))}
                         </div>
@@ -973,8 +1074,8 @@ export default function App() {
                         <h3 className="text-xs font-bold text-pink-600 mb-2">Modified Interactions</h3>
                         <div className="flex flex-wrap gap-1.5">
                           {modAnalysis.interactingResidues.map(r => (
-                            <span key={`${r.chain}${r.resn}${r.resi}`} className="px-2 py-1 bg-pink-50 text-pink-700 text-xs rounded border border-pink-100 font-mono" title={Array.from(r.types).join(', ')}>
-                              {r.chain}:{r.resn}{r.resi}
+                            <span key={`${r.chain}${r.resn}${r.resi}`} className="px-2 py-1 bg-pink-50 text-pink-700 text-[10px] rounded border border-pink-100 font-mono" title={Array.from(r.types).join(', ')}>
+                              L({Array.from(r.ligands || []).join(',')}) ↔ R({r.chain}:{r.resn}{r.resi})
                             </span>
                           ))}
                         </div>
